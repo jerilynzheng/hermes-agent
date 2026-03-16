@@ -8,6 +8,7 @@ Add, remove, or reorder entries here — both `hermes setup` and
 from __future__ import annotations
 
 import json
+import os
 import urllib.request
 import urllib.error
 from difflib import get_close_matches
@@ -78,6 +79,20 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "claude-sonnet-4-20250514",
         "claude-haiku-4-5-20251001",
     ],
+    "ai-gateway": [
+        "anthropic/claude-opus-4.6",
+        "anthropic/claude-sonnet-4.6",
+        "anthropic/claude-sonnet-4.5",
+        "anthropic/claude-haiku-4.5",
+        "openai/gpt-5",
+        "openai/gpt-4.1",
+        "openai/gpt-4.1-mini",
+        "google/gemini-3-pro-preview",
+        "google/gemini-3-flash",
+        "google/gemini-2.5-pro",
+        "google/gemini-2.5-flash",
+        "deepseek/deepseek-v3.2",
+    ],
 }
 
 _PROVIDER_LABELS = {
@@ -89,6 +104,7 @@ _PROVIDER_LABELS = {
     "minimax": "MiniMax",
     "minimax-cn": "MiniMax (China)",
     "anthropic": "Anthropic",
+    "ai-gateway": "AI Gateway",
     "custom": "Custom endpoint",
 }
 
@@ -103,6 +119,9 @@ _PROVIDER_ALIASES = {
     "minimax_cn": "minimax-cn",
     "claude": "anthropic",
     "claude-code": "anthropic",
+    "aigateway": "ai-gateway",
+    "vercel": "ai-gateway",
+    "vercel-ai-gateway": "ai-gateway",
 }
 
 
@@ -135,7 +154,7 @@ def list_available_providers() -> list[dict[str, str]]:
     """
     # Canonical providers in display order
     _PROVIDER_ORDER = [
-        "openrouter", "nous", "openai-codex",
+        "ai-gateway", "openrouter", "nous", "openai-codex",
         "zai", "kimi-coding", "minimax", "minimax-cn", "anthropic",
     ]
     # Build reverse alias map
@@ -261,6 +280,10 @@ def provider_model_ids(provider: Optional[str]) -> list[str]:
         live = _fetch_anthropic_models()
         if live:
             return live
+    if normalized == "ai-gateway":
+        live = _fetch_ai_gateway_models()
+        if live:
+            return live
     return list(_PROVIDER_MODELS.get(normalized, []))
 
 
@@ -308,6 +331,89 @@ def _fetch_anthropic_models(timeout: float = 5.0) -> Optional[list[str]]:
         return None
 
 
+def probe_api_models(
+    api_key: Optional[str],
+    base_url: Optional[str],
+    timeout: float = 5.0,
+) -> dict[str, Any]:
+    """Probe an OpenAI-compatible ``/models`` endpoint with light URL heuristics."""
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        return {
+            "models": None,
+            "probed_url": None,
+            "resolved_base_url": "",
+            "suggested_base_url": None,
+            "used_fallback": False,
+        }
+
+    if normalized.endswith("/v1"):
+        alternate_base = normalized[:-3].rstrip("/")
+    else:
+        alternate_base = normalized + "/v1"
+
+    candidates: list[tuple[str, bool]] = [(normalized, False)]
+    if alternate_base and alternate_base != normalized:
+        candidates.append((alternate_base, True))
+
+    tried: list[str] = []
+    headers: dict[str, str] = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    for candidate_base, is_fallback in candidates:
+        url = candidate_base.rstrip("/") + "/models"
+        tried.append(url)
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode())
+                return {
+                    "models": [m.get("id", "") for m in data.get("data", [])],
+                    "probed_url": url,
+                    "resolved_base_url": candidate_base.rstrip("/"),
+                    "suggested_base_url": alternate_base if alternate_base != candidate_base else normalized,
+                    "used_fallback": is_fallback,
+                }
+        except Exception:
+            continue
+
+    return {
+        "models": None,
+        "probed_url": tried[-1] if tried else normalized.rstrip("/") + "/models",
+        "resolved_base_url": normalized,
+        "suggested_base_url": alternate_base if alternate_base != normalized else None,
+        "used_fallback": False,
+    }
+
+
+def _fetch_ai_gateway_models(timeout: float = 5.0) -> Optional[list[str]]:
+    """Fetch available language models with tool-use from AI Gateway."""
+    api_key = os.getenv("AI_GATEWAY_API_KEY", "").strip()
+    if not api_key:
+        return None
+    base_url = os.getenv("AI_GATEWAY_BASE_URL", "").strip()
+    if not base_url:
+        from hermes_constants import AI_GATEWAY_BASE_URL
+        base_url = AI_GATEWAY_BASE_URL
+
+    url = base_url.rstrip("/") + "/models"
+    headers: dict[str, str] = {"Authorization": f"Bearer {api_key}"}
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+            return [
+                m["id"]
+                for m in data.get("data", [])
+                if m.get("id")
+                and m.get("type") == "language"
+                and "tool-use" in (m.get("tags") or [])
+            ]
+    except Exception:
+        return None
+
+
 def fetch_api_models(
     api_key: Optional[str],
     base_url: Optional[str],
@@ -318,22 +424,7 @@ def fetch_api_models(
     Returns a list of model ID strings, or ``None`` if the endpoint could not
     be reached (network error, timeout, auth failure, etc.).
     """
-    if not base_url:
-        return None
-
-    url = base_url.rstrip("/") + "/models"
-    headers: dict[str, str] = {}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    req = urllib.request.Request(url, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode())
-            # Standard OpenAI format: {"data": [{"id": "model-name", ...}, ...]}
-            return [m.get("id", "") for m in data.get("data", [])]
-    except Exception:
-        return None
+    return probe_api_models(api_key, base_url, timeout=timeout).get("models")
 
 
 def validate_requested_model(
@@ -376,13 +467,53 @@ def validate_requested_model(
             "message": "Model names cannot contain spaces.",
         }
 
-    # Custom endpoints can serve any model — skip validation
     if normalized == "custom":
+        probe = probe_api_models(api_key, base_url)
+        api_models = probe.get("models")
+        if api_models is not None:
+            if requested in set(api_models):
+                return {
+                    "accepted": True,
+                    "persist": True,
+                    "recognized": True,
+                    "message": None,
+                }
+
+            suggestions = get_close_matches(requested, api_models, n=3, cutoff=0.5)
+            suggestion_text = ""
+            if suggestions:
+                suggestion_text = "\n  Similar models: " + ", ".join(f"`{s}`" for s in suggestions)
+
+            message = (
+                f"Note: `{requested}` was not found in this custom endpoint's model listing "
+                f"({probe.get('probed_url')}). It may still work if the server supports hidden or aliased models."
+                f"{suggestion_text}"
+            )
+            if probe.get("used_fallback"):
+                message += (
+                    f"\n  Endpoint verification succeeded after trying `{probe.get('resolved_base_url')}`. "
+                    f"Consider saving that as your base URL."
+                )
+
+            return {
+                "accepted": True,
+                "persist": True,
+                "recognized": False,
+                "message": message,
+            }
+
+        message = (
+            f"Note: could not reach this custom endpoint's model listing at `{probe.get('probed_url')}`. "
+            f"Hermes will still save `{requested}`, but the endpoint should expose `/models` for verification."
+        )
+        if probe.get("suggested_base_url"):
+            message += f"\n  If this server expects `/v1`, try base URL: `{probe.get('suggested_base_url')}`"
+
         return {
             "accepted": True,
             "persist": True,
             "recognized": False,
-            "message": None,
+            "message": message,
         }
 
     # Probe the live API to check if the model actually exists

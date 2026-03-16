@@ -114,12 +114,31 @@ def _get_file_ops(task_id: str = "default") -> ShellFileOperations:
                     "container_persistent": config.get("container_persistent", True),
                     "docker_volumes": config.get("docker_volumes", []),
                 }
+
+            ssh_config = None
+            if env_type == "ssh":
+                ssh_config = {
+                    "host": config.get("ssh_host", ""),
+                    "user": config.get("ssh_user", ""),
+                    "port": config.get("ssh_port", 22),
+                    "key": config.get("ssh_key", ""),
+                    "persistent": config.get("ssh_persistent", False),
+                }
+
+            local_config = None
+            if env_type == "local":
+                local_config = {
+                    "persistent": config.get("local_persistent", False),
+                }
+
             terminal_env = _create_environment(
                 env_type=env_type,
                 image=image,
                 cwd=cwd,
                 timeout=config["timeout"],
+                ssh_config=ssh_config,
                 container_config=container_config,
+                local_config=local_config,
                 task_id=task_id,
             )
 
@@ -464,7 +483,7 @@ def _handle_search_files(args, **kw):
         output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
 
 
-registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs)
-registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs)
-registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs)
-registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs)
+registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖")
+registry.register(name="write_file", toolset="file", schema=WRITE_FILE_SCHEMA, handler=_handle_write_file, check_fn=_check_file_reqs, emoji="✍️")
+registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧")
+registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎")

@@ -760,6 +760,7 @@ def cmd_model(args):
         active = "custom"
 
     provider_labels = {
+        "ai-gateway": "AI Gateway",
         "openrouter": "OpenRouter",
         "nous": "Nous Portal",
         "openai-codex": "OpenAI Codex",
@@ -779,6 +780,7 @@ def cmd_model(args):
 
     # Step 1: Provider selection — put active provider first with marker
     providers = [
+        ("ai-gateway", "AI Gateway (Vercel — 200+ models, pay-per-use)"),
         ("openrouter", "OpenRouter (100+ models, pay-per-use)"),
         ("nous", "Nous Portal (Nous Research subscription)"),
         ("openai-codex", "OpenAI Codex"),
@@ -855,7 +857,7 @@ def cmd_model(args):
         _model_flow_anthropic(config, current_model)
     elif selected_provider == "kimi-coding":
         _model_flow_kimi(config, current_model)
-    elif selected_provider in ("zai", "minimax", "minimax-cn"):
+    elif selected_provider in ("zai", "minimax", "minimax-cn", "ai-gateway"):
         _model_flow_api_key_provider(config, selected_provider, current_model)
 
 
@@ -1112,8 +1114,32 @@ def _model_flow_custom(config):
 
     effective_key = api_key or current_key
 
+    from hermes_cli.models import probe_api_models
+
+    probe = probe_api_models(effective_key, effective_url)
+    if probe.get("used_fallback") and probe.get("resolved_base_url"):
+        print(
+            f"Warning: endpoint verification worked at {probe['resolved_base_url']}/models, "
+            f"not the exact URL you entered. Saving the working base URL instead."
+        )
+        effective_url = probe["resolved_base_url"]
+        if base_url:
+            base_url = effective_url
+    elif probe.get("models") is not None:
+        print(
+            f"Verified endpoint via {probe.get('probed_url')} "
+            f"({len(probe.get('models') or [])} model(s) visible)"
+        )
+    else:
+        print(
+            f"Warning: could not verify this endpoint via {probe.get('probed_url')}. "
+            f"Hermes will still save it."
+        )
+        if probe.get("suggested_base_url"):
+            print(f"  If this server expects /v1, try base URL: {probe['suggested_base_url']}")
+
     if base_url:
-        save_env_value("OPENAI_BASE_URL", base_url)
+        save_env_value("OPENAI_BASE_URL", effective_url)
     if api_key:
         save_env_value("OPENAI_API_KEY", api_key)
 

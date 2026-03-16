@@ -90,6 +90,7 @@ from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
     get_cute_tool_message as _get_cute_tool_message_impl,
     _detect_tool_failure,
+    get_tool_emoji as _get_tool_emoji,
 )
 from agent.trajectory import (
     convert_scratchpad_to_think, has_incomplete_scratchpad,
@@ -3301,8 +3302,7 @@ class AIAgent:
             extra_body["provider"] = provider_preferences
         _is_nous = "nousresearch" in self.base_url.lower()
 
-        _is_mistral = "api.mistral.ai" in self.base_url.lower()
-        if (_is_openrouter or _is_nous) and not _is_mistral:
+        if self._supports_reasoning_extra_body():
             if self.reasoning_config is not None:
                 rc = dict(self.reasoning_config)
                 # Nous Portal requires reasoning enabled — don't send
@@ -3326,6 +3326,34 @@ class AIAgent:
 
         return api_kwargs
 
+    def _supports_reasoning_extra_body(self) -> bool:
+        """Return True when reasoning extra_body is safe to send for this route/model.
+
+        OpenRouter forwards unknown extra_body fields to upstream providers.
+        Some providers/routes reject `reasoning` with 400s, so gate it to
+        known reasoning-capable model families and direct Nous Portal.
+        """
+        base_url = (self.base_url or "").lower()
+        if "nousresearch" in base_url:
+            return True
+        if "ai-gateway.vercel.sh" in base_url:
+            return True
+        if "openrouter" not in base_url:
+            return False
+        if "api.mistral.ai" in base_url:
+            return False
+
+        model = (self.model or "").lower()
+        reasoning_model_prefixes = (
+            "deepseek/",
+            "anthropic/",
+            "openai/",
+            "x-ai/",
+            "google/gemini-2",
+            "qwen/qwen3",
+        )
+        return any(model.startswith(prefix) for prefix in reasoning_model_prefixes)
+
     def _build_assistant_message(self, assistant_message, finish_reason: str) -> dict:
         """Build a normalized assistant message dict from an API response message.
 
@@ -3345,8 +3373,7 @@ class AIAgent:
                 reasoning_text = combined or None
 
         if reasoning_text and self.verbose_logging:
-            preview = reasoning_text[:100] + "..." if len(reasoning_text) > 100 else reasoning_text
-            logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {preview}")
+            logging.debug(f"Captured reasoning ({len(reasoning_text)} chars): {reasoning_text}")
 
         if reasoning_text and self.reasoning_callback:
             try:
@@ -3823,8 +3850,12 @@ class AIAgent:
             print(f"  ⚡ Concurrent: {num_tools} tool calls — {tool_names_str}")
             for i, (tc, name, args) in enumerate(parsed_calls, 1):
                 args_str = json.dumps(args, ensure_ascii=False)
-                args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
-                print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
+                if self.verbose_logging:
+                    print(f"  📞 Tool {i}: {name}({list(args.keys())})")
+                    print(f"     Args: {args_str}")
+                else:
+                    args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
+                    print(f"  📞 Tool {i}: {name}({list(args.keys())}) - {args_preview}")
 
         for _, name, args in parsed_calls:
             if self.tool_progress_callback:
@@ -3889,17 +3920,20 @@ class AIAgent:
                     logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
                 if self.verbose_logging:
-                    result_preview = function_result[:200] if len(function_result) > 200 else function_result
                     logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-                    logging.debug(f"Tool result preview: {result_preview}...")
+                    logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
 
             # Print cute message per tool
             if self.quiet_mode:
                 cute_msg = _get_cute_tool_message_impl(name, args, tool_duration, result=function_result)
                 print(f"  {cute_msg}")
             elif not self.quiet_mode:
-                response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
-                print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
+                if self.verbose_logging:
+                    print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s")
+                    print(f"     Result: {function_result}")
+                else:
+                    response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
+                    print(f"  ✅ Tool {i+1} completed in {tool_duration:.2f}s - {response_preview}")
 
             # Truncate oversized results
             MAX_TOOL_RESULT_CHARS = 100_000
@@ -3975,8 +4009,12 @@ class AIAgent:
 
             if not self.quiet_mode:
                 args_str = json.dumps(function_args, ensure_ascii=False)
-                args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
-                print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
+                if self.verbose_logging:
+                    print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())})")
+                    print(f"     Args: {args_str}")
+                else:
+                    args_preview = args_str[:self.log_prefix_chars] + "..." if len(args_str) > self.log_prefix_chars else args_str
+                    print(f"  📞 Tool {i}: {function_name}({list(function_args.keys())}) - {args_preview}")
 
             if self.tool_progress_callback:
                 try:
@@ -4085,23 +4123,7 @@ class AIAgent:
                         self._vprint(f"  {cute_msg}")
             elif self.quiet_mode and self._stream_callback is None:
                 face = random.choice(KawaiiSpinner.KAWAII_WAITING)
-                tool_emoji_map = {
-                    'web_search': '🔍', 'web_extract': '📄', 'web_crawl': '🕸️',
-                    'terminal': '💻', 'process': '⚙️',
-                    'read_file': '📖', 'write_file': '✍️', 'patch': '🔧', 'search_files': '🔎',
-                    'browser_navigate': '🌐', 'browser_snapshot': '📸',
-                    'browser_click': '👆', 'browser_type': '⌨️',
-                    'browser_scroll': '📜', 'browser_back': '◀️',
-                    'browser_press': '⌨️', 'browser_close': '🚪',
-                    'browser_get_images': '🖼️', 'browser_vision': '👁️',
-                    'image_generate': '🎨', 'text_to_speech': '🔊',
-                    'vision_analyze': '👁️', 'mixture_of_agents': '🧠',
-                    'skills_list': '📚', 'skill_view': '📚',
-                    'cronjob': '⏰',
-                    'send_message': '📨', 'todo': '📋', 'memory': '🧠', 'session_search': '🔍',
-                    'clarify': '❓', 'execute_code': '🐍', 'delegate_task': '🔀',
-                }
-                emoji = tool_emoji_map.get(function_name, '⚡')
+                emoji = _get_tool_emoji(function_name)
                 preview = _build_tool_preview(function_name, function_args) or function_name
                 if len(preview) > 30:
                     preview = preview[:27] + "..."
@@ -4132,7 +4154,9 @@ class AIAgent:
                     logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
                 tool_duration = time.time() - tool_start_time
 
-            result_preview = function_result[:200] if len(function_result) > 200 else function_result
+            result_preview = function_result if self.verbose_logging else (
+                function_result[:200] if len(function_result) > 200 else function_result
+            )
 
             # Log tool errors to the persistent error log so [error] tags
             # in the UI always have a corresponding detailed entry on disk.
@@ -4142,7 +4166,7 @@ class AIAgent:
 
             if self.verbose_logging:
                 logging.debug(f"Tool {function_name} completed in {tool_duration:.2f}s")
-                logging.debug(f"Tool result preview: {result_preview}...")
+                logging.debug(f"Tool result ({len(function_result)} chars): {function_result}")
 
             # Guard against tools returning absurdly large content that would
             # blow up the context window. 100K chars ≈ 25K tokens — generous
@@ -4165,8 +4189,12 @@ class AIAgent:
             messages.append(tool_msg)
 
             if not self.quiet_mode:
-                response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
-                print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
+                if self.verbose_logging:
+                    print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
+                    print(f"     Result: {function_result}")
+                else:
+                    response_preview = function_result[:self.log_prefix_chars] + "..." if len(function_result) > self.log_prefix_chars else function_result
+                    print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 
             if self._interrupt_requested and i < len(assistant_message.tool_calls):
                 remaining = len(assistant_message.tool_calls) - i
@@ -4264,9 +4292,8 @@ class AIAgent:
                     api_messages.insert(sys_offset + idx, pfm.copy())
 
             summary_extra_body = {}
-            _is_openrouter = "openrouter" in self.base_url.lower()
             _is_nous = "nousresearch" in self.base_url.lower()
-            if _is_openrouter or _is_nous:
+            if self._supports_reasoning_extra_body():
                 if self.reasoning_config is not None:
                     summary_extra_body["reasoning"] = self.reasoning_config
                 else:
@@ -5418,7 +5445,10 @@ class AIAgent:
 
                 # Handle assistant response
                 if assistant_message.content and not self.quiet_mode:
-                    self._vprint(f"{self.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
+                    if self.verbose_logging:
+                        self._vprint(f"{self.log_prefix}🤖 Assistant: {assistant_message.content}")
+                    else:
+                        self._vprint(f"{self.log_prefix}🤖 Assistant: {assistant_message.content[:100]}{'...' if len(assistant_message.content) > 100 else ''}")
 
                 # Notify progress callback of model's thinking (used by subagent
                 # delegation to relay the child's reasoning to the parent display).

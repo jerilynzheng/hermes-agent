@@ -328,6 +328,8 @@ def load_cli_config() -> Dict[str, Any]:
         "container_persistent": "TERMINAL_CONTAINER_PERSISTENT",
         "docker_volumes": "TERMINAL_DOCKER_VOLUMES",
         "sandbox_dir": "TERMINAL_SANDBOX_DIR",
+        # Persistent shell (non-local backends)
+        "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
         # Sudo support (works with all backends)
         "sudo_password": "SUDO_PASSWORD",
     }
@@ -1414,7 +1416,7 @@ class HermesCLI:
                 max_iterations=self.max_turns,
                 enabled_toolsets=self.enabled_toolsets,
                 verbose_logging=self.verbose,
-                quiet_mode=True,
+                quiet_mode=not self.verbose,
                 ephemeral_system_prompt=self.system_prompt if self.system_prompt else None,
                 prefill_messages=self.prefill_messages or None,
                 reasoning_config=self.reasoning_config,
@@ -1428,7 +1430,7 @@ class HermesCLI:
                 platform="cli",
                 session_db=self._session_db,
                 clarify_callback=self._clarify_callback,
-                reasoning_callback=self._on_reasoning if self.show_reasoning else None,
+                reasoning_callback=self._on_reasoning if (self.show_reasoning or self.verbose) else None,
                 honcho_session_key=None,  # resolved by run_agent via config sessions map / title
                 fallback_model=self._fallback_model,
                 thinking_callback=self._on_thinking,
@@ -3285,12 +3287,17 @@ class HermesCLI:
         if self.agent:
             self.agent.verbose_logging = self.verbose
             self.agent.quiet_mode = not self.verbose
+            # Auto-enable reasoning display in verbose mode
+            if self.verbose:
+                self.agent.reasoning_callback = self._on_reasoning
+            elif not self.show_reasoning:
+                self.agent.reasoning_callback = None
 
         labels = {
             "off": "[dim]Tool progress: OFF[/] — silent mode, just the final response.",
             "new": "[yellow]Tool progress: NEW[/] — show each new tool (skip repeats).",
             "all": "[green]Tool progress: ALL[/] — show every tool call.",
-            "verbose": "[bold green]Tool progress: VERBOSE[/] — full args, results, and debug logs.",
+            "verbose": "[bold green]Tool progress: VERBOSE[/] — full args, results, think blocks, and debug logs.",
         }
         self.console.print(labels.get(self.tool_progress_mode, ""))
 
@@ -3357,13 +3364,17 @@ class HermesCLI:
 
     def _on_reasoning(self, reasoning_text: str):
         """Callback for intermediate reasoning display during tool-call loops."""
-        lines = reasoning_text.strip().splitlines()
-        if len(lines) > 5:
-            preview = "\n".join(lines[:5])
-            preview += f"\n  ... ({len(lines) - 5} more lines)"
+        if self.verbose:
+            # Verbose mode: show full reasoning text
+            _cprint(f"  {_DIM}[thinking] {reasoning_text.strip()}{_RST}")
         else:
-            preview = reasoning_text.strip()
-        _cprint(f"  {_DIM}[thinking] {preview}{_RST}")
+            lines = reasoning_text.strip().splitlines()
+            if len(lines) > 5:
+                preview = "\n".join(lines[:5])
+                preview += f"\n  ... ({len(lines) - 5} more lines)"
+            else:
+                preview = reasoning_text.strip()
+            _cprint(f"  {_DIM}[thinking] {preview}{_RST}")
 
     def _manual_compress(self):
         """Manually trigger context compression on the current conversation."""
@@ -3483,6 +3494,56 @@ class HermesCLI:
             db.close()
         except Exception as e:
             print(f"  Error generating insights: {e}")
+
+    def _check_config_mcp_changes(self) -> None:
+        """Detect mcp_servers changes in config.yaml and auto-reload MCP connections.
+
+        Called from process_loop every CONFIG_WATCH_INTERVAL seconds.
+        Compares config.yaml mtime + mcp_servers section against the last
+        known state.  When a change is detected, triggers _reload_mcp() and
+        informs the user so they know the tool list has been refreshed.
+        """
+        import time
+        import yaml as _yaml
+
+        CONFIG_WATCH_INTERVAL = 5.0  # seconds between config.yaml stat() calls
+
+        now = time.monotonic()
+        if now - self._last_config_check < CONFIG_WATCH_INTERVAL:
+            return
+        self._last_config_check = now
+
+        from hermes_cli.config import get_config_path as _get_config_path
+        cfg_path = _get_config_path()
+        if not cfg_path.exists():
+            return
+
+        try:
+            mtime = cfg_path.stat().st_mtime
+        except OSError:
+            return
+
+        if mtime == self._config_mtime:
+            return  # File unchanged — fast path
+
+        # File changed — check whether mcp_servers section changed
+        self._config_mtime = mtime
+        try:
+            with open(cfg_path, encoding="utf-8") as f:
+                new_cfg = _yaml.safe_load(f) or {}
+        except Exception:
+            return
+
+        new_mcp = new_cfg.get("mcp_servers") or {}
+        if new_mcp == self._config_mcp_servers:
+            return  # mcp_servers unchanged (some other section was edited)
+
+        self._config_mcp_servers = new_mcp
+        # Notify user and reload
+        print()
+        print("🔄 MCP server config changed — reloading connections...")
+        with self._busy_command(self._slow_command_status("/reload-mcp")):
+            self._reload_mcp()
 
     def _reload_mcp(self):
         """Reload MCP servers: disconnect all, re-read config.yaml, reconnect.
@@ -4749,6 +4810,12 @@ class HermesCLI:
         self._interrupt_queue = queue.Queue()   # For messages typed while agent is running
         self._should_exit = False
         self._last_ctrl_c_time = 0  # Track double Ctrl+C for force exit
+        # Config file watcher — detect mcp_servers changes and auto-reload
+        from hermes_cli.config import get_config_path as _get_config_path
+        _cfg_path = _get_config_path()
+        self._config_mtime: float = _cfg_path.stat().st_mtime if _cfg_path.exists() else 0.0
+        self._config_mcp_servers: dict = self.config.get("mcp_servers") or {}
+        self._last_config_check: float = 0.0  # monotonic time of last check
 
         # Clarify tool state: interactive question/answer with the user.
         # When the agent calls the clarify tool, _clarify_state is set and
@@ -4797,7 +4864,7 @@ class HermesCLI:
         # Ensure tirith security scanner is available (downloads if needed)
         try:
             from tools.tirith_security import ensure_installed
-            ensure_installed()
+            ensure_installed(log_failures=False)
         except Exception:
             pass  # Non-fatal — fail-open at scan time if unavailable
         
@@ -5682,6 +5749,9 @@ class HermesCLI:
                     try:
                         user_input = self._pending_input.get(timeout=0.1)
                     except queue.Empty:
+                        # Periodic config watcher — auto-reload MCP on mcp_servers change
+                        if not self._agent_running:
+                            self._check_config_mcp_changes()
                         continue
                     
                     if not user_input:
