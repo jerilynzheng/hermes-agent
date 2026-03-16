@@ -154,7 +154,7 @@ def list_available_providers() -> list[dict[str, str]]:
     """
     # Canonical providers in display order
     _PROVIDER_ORDER = [
-        "openrouter", "ai-gateway", "nous", "openai-codex",
+        "ai-gateway", "openrouter", "nous", "openai-codex",
         "zai", "kimi-coding", "minimax", "minimax-cn", "anthropic",
     ]
     # Build reverse alias map
